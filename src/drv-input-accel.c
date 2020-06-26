@@ -9,6 +9,7 @@
 #include "drivers.h"
 #include "accel-mount-matrix.h"
 
+#define __USE_XOPEN2K8
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
