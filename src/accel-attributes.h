@@ -12,17 +12,13 @@
 #include <gudev/gudev.h>
 
 #include "accel-scale.h"
+#include "sensor-attributes.h"
 
-typedef enum {
-	ACCEL_LOCATION_DISPLAY,
-	ACCEL_LOCATION_BASE,
-} AccelLocation;
-
-AccelLocation setup_accel_location (GUdevDevice *device);
+SensorLocation setup_accel_location (GUdevDevice *device);
 
 gboolean parse_accel_location (const char    *location,
-                               AccelLocation *value);
+                               SensorLocation *value);
 gboolean parse_accel_label (const char    *location,
-                            AccelLocation *value);
+                            SensorLocation *value);
 
 gboolean get_accel_scale (GUdevDevice *device, AccelScale *scale_vec);

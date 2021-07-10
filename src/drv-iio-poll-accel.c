@@ -21,7 +21,6 @@ typedef struct DrvData {
 	guint               timeout_id;
 	GUdevDevice        *dev;
 	AccelVec3          *mount_matrix;
-	AccelLocation       location;
 	AccelScale          scale;
 } DrvData;
 
@@ -111,7 +110,6 @@ iio_poll_accel_open (GUdevDevice *device)
 	drv_data = (DrvData *) sensor_device->priv;
 	drv_data->dev = g_object_ref (device);
 	drv_data->mount_matrix = setup_mount_matrix (device);
-	drv_data->location = setup_accel_location (device);
 	if (!get_accel_scale (device, &drv_data->scale))
 		reset_accel_scale (&drv_data->scale);
 

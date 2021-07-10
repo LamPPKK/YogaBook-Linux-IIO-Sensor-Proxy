@@ -623,7 +623,8 @@ enable_sensors (GUdevDevice *dev,
 	device_dir = g_build_filename (g_udev_device_get_sysfs_path (dev), "scan_elements", NULL);
 	dir = g_dir_open (device_dir, 0, &error);
 	if (!dir) {
-		g_warning ("Failed to open directory '%s': %s", device_dir, error->message);
+		if (enable)
+			g_warning ("Failed to open directory '%s': %s", device_dir, error->message);
 		g_free (device_dir);
 		return FALSE;
 	}

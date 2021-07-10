@@ -10,10 +10,10 @@
 
 #include "accel-attributes.h"
 
-AccelLocation
+SensorLocation
 setup_accel_location (GUdevDevice *device)
 {
-	AccelLocation ret;
+	SensorLocation ret;
 	const char *location;
 
 	location = g_udev_device_get_property (device, "ACCEL_LOCATION");
@@ -39,21 +39,21 @@ setup_accel_location (GUdevDevice *device)
 	}
 	g_debug ("No auto-detected location, falling back to display location");
 
-	ret = ACCEL_LOCATION_DISPLAY;
+	ret = SENSOR_LOCATION_DISPLAY;
 	return ret;
 }
 
 gboolean
-parse_accel_label (const char *location, AccelLocation *value)
+parse_accel_label (const char *location, SensorLocation *value)
 {
 	if (location == NULL ||
 	    *location == '\0')
 		return FALSE;
 	if (g_str_equal (location, "accel-base")) {
-		*value = ACCEL_LOCATION_BASE;
+		*value = SENSOR_LOCATION_BASE;
 		return TRUE;
 	} else if (g_str_equal (location, "accel-display")) {
-		*value = ACCEL_LOCATION_DISPLAY;
+		*value = SENSOR_LOCATION_DISPLAY;
 		return TRUE;
 	}
 	g_debug ("Failed to parse label '%s' as a location", location);
@@ -61,17 +61,17 @@ parse_accel_label (const char *location, AccelLocation *value)
 }
 
 gboolean
-parse_accel_location (const char *location, AccelLocation *value)
+parse_accel_location (const char *location, SensorLocation *value)
 {
 	/* Empty string means we use the display location */
 	if (location == NULL ||
 	    *location == '\0' ||
 	    g_str_equal (location, "display") ||
 	    g_str_equal (location, "lid")) {
-		*value = ACCEL_LOCATION_DISPLAY;
+		*value = SENSOR_LOCATION_DISPLAY;
 		return TRUE;
 	} else if (g_str_equal (location, "base")) {
-		*value = ACCEL_LOCATION_BASE;
+		*value = SENSOR_LOCATION_BASE;
 		return TRUE;
 	} else {
 		g_warning ("Failed to parse '%s' as a location", location);

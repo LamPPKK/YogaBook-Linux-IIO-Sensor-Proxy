@@ -1,0 +1,10 @@
+
+#ifndef _SENSOR_ATTRIBUTES_H_
+#define _SENSOR_ATTRIBUTES_H_
+
+typedef enum {
+	SENSOR_LOCATION_DISPLAY,
+	SENSOR_LOCATION_BASE,
+} SensorLocation;
+
+#endif /* _SENSOR_ATTRIBUTES_H_ */

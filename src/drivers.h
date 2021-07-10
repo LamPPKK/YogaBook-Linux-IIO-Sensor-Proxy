@@ -6,9 +6,13 @@
  * the Free Software Foundation.
  */
 
+#ifndef _DRIVERS_H_
+#define _DRIVERS_H_
+
 #include <glib.h>
 #include <gudev/gudev.h>
 
+#include "sensor-attributes.h"
 #include "accel-attributes.h"
 #include "accel-scale.h"
 
@@ -65,8 +69,10 @@ typedef struct {
 
 struct SensorDevice {
 	SensorDriver        *drv;
+	GUdevDevice         *udev_device;
 	gpointer             priv;
 	char                *name;
+	SensorLocation      location;
 
 	/* Callback function and data as pass to driver_open() */
 	ReadingsUpdateFunc   callback_func;
@@ -81,13 +87,7 @@ driver_discover (SensorDriver *driver,
 	g_return_val_if_fail (driver->discover, FALSE);
 	g_return_val_if_fail (device, FALSE);
 
-	if (!driver->discover (device))
-		return FALSE;
-
-	if (driver->type != DRIVER_TYPE_ACCEL)
-		return TRUE;
-
-	return (setup_accel_location (device) == ACCEL_LOCATION_DISPLAY);
+	return driver->discover (device);
 }
 
 static inline SensorDevice *
@@ -107,8 +107,15 @@ driver_open (SensorDriver       *driver,
 	if (!sensor_device)
 		return NULL;
 	sensor_device->drv = driver;
+	sensor_device->udev_device = g_object_ref(device);
 	sensor_device->callback_func = callback_func;
 	sensor_device->user_data = user_data;
+
+	if (driver->type == DRIVER_TYPE_ACCEL)
+		sensor_device->location = setup_accel_location (device);
+	else
+		sensor_device->location = SENSOR_LOCATION_DISPLAY;
+
 	return sensor_device;
 }
 
@@ -136,6 +143,7 @@ driver_close (SensorDevice *sensor_device)
 	g_return_if_fail (sensor_device);
 	driver_set_polling (sensor_device, FALSE);
 	g_clear_pointer (&sensor_device->name, g_free);
+	g_clear_object (&sensor_device->udev_device);
 	driver = sensor_device->drv;
 	g_return_if_fail (driver->close);
 	driver->close (sensor_device);
@@ -153,3 +161,5 @@ extern SensorDriver iio_buffer_compass;
 extern SensorDriver iio_poll_proximity;
 
 gboolean drv_check_udev_sensor_type (GUdevDevice *device, const gchar *match, const char *name);
+
+#endif /* _DRIVERS_H_ */
