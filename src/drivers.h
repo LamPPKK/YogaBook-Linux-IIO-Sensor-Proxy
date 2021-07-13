@@ -21,6 +21,7 @@ typedef enum {
 	DRIVER_TYPE_LIGHT,
 	DRIVER_TYPE_COMPASS,
 	DRIVER_TYPE_PROXIMITY,
+	DRIVER_TYPE_HINGE_ANGLE,
 } DriverType;
 
 typedef enum {
@@ -55,6 +56,15 @@ typedef void (*ReadingsUpdateFunc) (SensorDevice *sensor_device,
 				    gpointer      readings,
 				    gpointer      user_data);
 
+typedef enum {
+	TABLET_MODE_LAPTOP,
+	TABLET_MODE_TABLET,
+	TABLET_MODE_UNKNOWN,
+} TabletMode;
+
+typedef struct {
+	gdouble angle;
+} HingeAngleReadings;
 
 typedef struct {
 	const char             *driver_name;

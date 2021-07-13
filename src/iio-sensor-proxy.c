@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 
 #include <gio/gio.h>
 #include <gudev/gudev.h>
@@ -28,7 +29,7 @@
 #define SENSOR_PROXY_IFACE_NAME         SENSOR_PROXY_DBUS_NAME
 #define SENSOR_PROXY_COMPASS_IFACE_NAME SENSOR_PROXY_DBUS_NAME ".Compass"
 
-#define NUM_SENSOR_TYPES DRIVER_TYPE_PROXIMITY + 1
+#define NUM_SENSOR_TYPES DRIVER_TYPE_HINGE_ANGLE + 1
 
 
 #define device_type(dev) (dev->drv->type)
@@ -47,6 +48,7 @@ typedef struct {
 
 	/* Accelerometer */
 	OrientationUp previous_orientation;
+	AccelReadings last_accel_readings[2]; /* For display and base locations */
 
 	/* Light */
 	gdouble previous_level;
@@ -57,6 +59,9 @@ typedef struct {
 
 	/* Proximity */
 	gboolean previous_prox_near;
+
+	gdouble previous_hinge_angle;
+	TabletMode previous_tablet_mode;
 } SensorData;
 
 static const SensorDriver * const drivers[] = {
@@ -86,8 +91,23 @@ driver_type_to_str (DriverType type)
 		return "compass";
 	case DRIVER_TYPE_PROXIMITY:
 		return "proximity";
+	case DRIVER_TYPE_HINGE_ANGLE:
+		return "hinge angle";
 	default:
 		g_assert_not_reached ();
+	}
+}
+
+static const char *
+tablet_mode_to_str (TabletMode mode)
+{
+	switch (mode) {
+	case TABLET_MODE_LAPTOP:
+		return "laptop";
+	case TABLET_MODE_TABLET:
+		return "tablet";
+	default:
+		return "unknown";
 	}
 }
 
@@ -97,8 +117,9 @@ static void sensor_changes (GUdevClient *client,
 			    SensorData  *data);
 
 /* Return the default device used for given sensor type */
-static SensorDevice *find_default_device_for_type (SensorData	*data,
-						  DriverType	driver_type)
+static SensorDevice *
+find_default_device_for_type (SensorData	*data,
+			      DriverType  driver_type)
 {
 	if (!data->devices[driver_type]->len)
 		return NULL;
@@ -119,11 +140,41 @@ static SensorDevice *find_default_device_for_type (SensorData	*data,
 	return g_ptr_array_index (data->devices[driver_type], 0);
 }
 
+static SensorDevice *
+find_accel_at (SensorData *data, SensorLocation location)
+{
+	guint i;
+
+	for (i = 0; i < data->devices[DRIVER_TYPE_ACCEL]->len; i++) {
+		SensorDevice *sensor_device =
+			g_ptr_array_index (data->devices[DRIVER_TYPE_ACCEL], i);
+
+		if (sensor_device->location == location)
+			return sensor_device;
+	}
+	return NULL;
+}
+
 static gboolean
 driver_type_exists (SensorData *data,
 		    DriverType  driver_type)
 {
 	return find_default_device_for_type (data, driver_type) != NULL;
+}
+
+static gboolean
+has_hinge_angle_sensor (SensorData *data)
+{
+	SensorDevice *display_accel, *base_accel;
+
+	if (driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE)) {
+		return TRUE;
+	}
+
+	display_accel = find_accel_at (data, SENSOR_LOCATION_DISPLAY);
+	base_accel = find_accel_at (data, SENSOR_LOCATION_BASE);
+
+	return display_accel && base_accel;
 }
 
 static gboolean
@@ -177,11 +228,11 @@ find_sensors (GUdevClient *client,
 static void
 free_client_watch (gpointer data)
 {
-       guint watch_id = GPOINTER_TO_UINT (data);
+	guint watch_id = GPOINTER_TO_UINT (data);
 
-       if (watch_id == 0)
-               return;
-       g_bus_unwatch_name (watch_id);
+	if (watch_id == 0)
+		return;
+	g_bus_unwatch_name (watch_id);
 }
 
 static GHashTable *
@@ -200,6 +251,9 @@ typedef enum {
 	PROP_COMPASS_HEADING            = 1 << 5,
 	PROP_HAS_PROXIMITY              = 1 << 6,
 	PROP_PROXIMITY_NEAR             = 1 << 7,
+	PROP_HAS_HINGE_ANGLE		= 1 << 8,
+	PROP_HINGE_ANGLE		= 1 << 9,
+	PROP_TABLET_MODE		= 1 << 10,
 } PropertiesMask;
 
 #define PROP_ALL (PROP_HAS_ACCELEROMETER | \
@@ -207,13 +261,17 @@ typedef enum {
                   PROP_HAS_AMBIENT_LIGHT | \
                   PROP_LIGHT_LEVEL | \
                   PROP_HAS_PROXIMITY | \
-		  PROP_PROXIMITY_NEAR)
+		  PROP_PROXIMITY_NEAR | \
+		  PROP_HAS_HINGE_ANGLE | \
+		  PROP_HINGE_ANGLE | \
+		  PROP_TABLET_MODE)
 #define PROP_ALL_COMPASS (PROP_HAS_COMPASS | \
 			  PROP_COMPASS_HEADING)
 #define PROP_ALL_HAS (PROP_HAS_ACCELEROMETER | \
 		      PROP_HAS_AMBIENT_LIGHT | \
 		      PROP_HAS_PROXIMITY | \
-		      PROP_HAS_COMPASS)
+		      PROP_HAS_COMPASS | \
+		      PROP_HAS_HINGE_ANGLE)
 
 static PropertiesMask
 mask_for_sensor_type (DriverType sensor_type)
@@ -231,6 +289,10 @@ mask_for_sensor_type (DriverType sensor_type)
 	case DRIVER_TYPE_PROXIMITY:
 		return PROP_HAS_PROXIMITY |
 			PROP_PROXIMITY_NEAR;
+	case DRIVER_TYPE_HINGE_ANGLE:
+		return PROP_HAS_HINGE_ANGLE |
+			PROP_HINGE_ANGLE |
+			PROP_TABLET_MODE;
 	default:
 		g_assert_not_reached ();
 	}
@@ -320,6 +382,48 @@ send_dbus_event_for_client (SensorData     *data,
 				       g_variant_new_boolean (data->previous_prox_near));
 	}
 
+	if (mask & PROP_HAS_HINGE_ANGLE) {
+		gboolean has_hinge_angle;
+
+		has_hinge_angle = driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE);
+
+		if (!has_hinge_angle) {
+			gboolean has_display_accel = FALSE, has_base_accel = FALSE;
+			guint i;
+
+			for (i = 0; i < data->devices[DRIVER_TYPE_ACCEL]->len; i++) {
+				SensorDevice *sensor_device =
+					g_ptr_array_index (data->devices[DRIVER_TYPE_ACCEL], i);
+
+				if (sensor_device->location == SENSOR_LOCATION_DISPLAY)
+					has_display_accel = TRUE;
+
+				if (sensor_device->location == SENSOR_LOCATION_BASE)
+					has_base_accel = TRUE;
+			}
+
+			has_hinge_angle = has_display_accel && has_base_accel;
+		}
+
+		g_variant_builder_add (&props_builder, "{sv}", "HasHingeAngle",
+				       g_variant_new_boolean (has_hinge_angle));
+
+		/* Send hinge angle information when the device appears */
+		if (has_hinge_angle)
+			mask |= PROP_HINGE_ANGLE | PROP_TABLET_MODE;
+	}
+
+	if (mask & PROP_HINGE_ANGLE) {
+		g_variant_builder_add (&props_builder, "{sv}", "HingeAngle",
+				       g_variant_new_double (data->previous_hinge_angle));
+	}
+
+	if (mask & PROP_TABLET_MODE) {
+		g_variant_builder_add (&props_builder, "{sv}", "TabletMode",
+				      g_variant_new_string (tablet_mode_to_str (data->previous_tablet_mode)));
+
+	}
+
 	props_changed = g_variant_new ("(s@a{sv}@as)", (mask & PROP_ALL) ? SENSOR_PROXY_IFACE_NAME : SENSOR_PROXY_COMPASS_IFACE_NAME,
 				       g_variant_builder_end (&props_builder),
 				       g_variant_new_strv (NULL, 0));
@@ -386,6 +490,8 @@ send_driver_changed_dbus_event (SensorData   *data,
 		send_dbus_event (data, PROP_HAS_AMBIENT_LIGHT);
 	else if (driver_type == DRIVER_TYPE_PROXIMITY)
 		send_dbus_event (data, PROP_HAS_PROXIMITY);
+	else if (driver_type == DRIVER_TYPE_HINGE_ANGLE)
+		send_dbus_event (data, PROP_HAS_HINGE_ANGLE);
 	else if (driver_type == DRIVER_TYPE_COMPASS)
 		send_dbus_event (data, PROP_HAS_COMPASS);
 	else
@@ -402,6 +508,54 @@ any_sensors_left (SensorData *data)
 			return TRUE;
 
 	return FALSE;
+}
+
+static void
+virt_hinge_angle_sensor_start (SensorData *data)
+{
+	SensorDevice *display_accel, *base_accel;
+	GHashTable *ht;
+
+	display_accel = find_accel_at (data, SENSOR_LOCATION_DISPLAY);
+	base_accel = find_accel_at (data, SENSOR_LOCATION_BASE);
+
+	if (!display_accel || !base_accel) {
+		return;
+	}
+
+	ht = data->clients[DRIVER_TYPE_ACCEL];
+
+	/* If the virtual hinge angle sensor is claimed but no accelerometer
+	 * were claimed before, start polling for default (display) accelerometer */
+	if (g_hash_table_size (ht) == 0) {
+		driver_set_polling (display_accel, TRUE);
+	}
+
+	driver_set_polling (base_accel, TRUE);
+}
+
+static void
+virt_hinge_angle_sensor_stop (SensorData *data)
+{
+	SensorDevice *display_accel, *base_accel;
+	GHashTable *ht;
+
+	display_accel = find_accel_at (data, SENSOR_LOCATION_DISPLAY);
+	base_accel = find_accel_at (data, SENSOR_LOCATION_BASE);
+
+	if (!display_accel || !base_accel) {
+		return;
+	}
+
+	ht = data->clients[DRIVER_TYPE_ACCEL];
+
+	/* If the virtual hinge angle sensor was claimed but no accelerometer
+	 * were claimed before, stop polling for default (display) accelerometer */
+	if (g_hash_table_size (ht) == 0) {
+		driver_set_polling (display_accel, FALSE);
+	}
+
+	driver_set_polling (base_accel, FALSE);
 }
 
 static void
@@ -424,9 +578,16 @@ client_release (SensorData            *data,
 	g_hash_table_remove (ht, sender);
 
 	sensor_device = find_default_device_for_type (data, driver_type);
-	if (sensor_device && g_hash_table_size (ht) == 0) {
-		driver_set_polling (sensor_device, FALSE);
+	if (g_hash_table_size (ht) == 0) {
+		if (sensor_device) {
+			driver_set_polling (sensor_device, FALSE);
+		} else {
+			if (driver_type == DRIVER_TYPE_HINGE_ANGLE) {
+				virt_hinge_angle_sensor_stop (data);
+			}
+		}
 	}
+
 }
 
 static void
@@ -488,9 +649,16 @@ handle_generic_method_call (SensorData            *data,
 		}
 
 		/* No other clients for this sensor? Start it */
-		if (sensor_device && (g_hash_table_size (ht) == 0)) {
-			driver_set_polling (sensor_device, TRUE);
+		if (g_hash_table_size (ht) == 0) {
+			if (sensor_device) {
+				driver_set_polling (sensor_device, TRUE);
+			} else {
+				if (driver_type == DRIVER_TYPE_HINGE_ANGLE) {
+					virt_hinge_angle_sensor_start (data);
+				}
+			}
 		}
+
 
 		watch_id = g_bus_watch_name_on_connection (data->connection,
 							   sender,
@@ -530,6 +698,9 @@ handle_method_call (GDBusConnection       *connection,
 	else if (g_strcmp0 (method_name, "ClaimProximity") == 0 ||
 		 g_strcmp0 (method_name, "ReleaseProximity") == 0)
 	        driver_type = DRIVER_TYPE_PROXIMITY;
+	else if (g_strcmp0 (method_name, "ClaimHingeAngle") == 0 ||
+		 g_strcmp0 (method_name, "ReleaseHingeAngle") == 0)
+	        driver_type = DRIVER_TYPE_HINGE_ANGLE;
 	else {
 		g_dbus_method_invocation_return_error (invocation,
 						       G_DBUS_ERROR,
@@ -571,6 +742,12 @@ handle_get_property (GDBusConnection *connection,
 		return g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_PROXIMITY));
 	if (g_strcmp0 (property_name, "ProximityNear") == 0)
 		return g_variant_new_boolean (data->previous_prox_near);
+	if (g_strcmp0 (property_name, "HasHingeAngle") == 0)
+		return g_variant_new_boolean (has_hinge_angle_sensor (data));
+	if (g_strcmp0 (property_name, "HingeAngle") == 0)
+		return g_variant_new_double (data->previous_hinge_angle);
+	if (g_strcmp0 (property_name, "TabletMode") == 0)
+		return g_variant_new_string (tablet_mode_to_str (data->previous_tablet_mode));
 
 	return NULL;
 }
@@ -732,6 +909,130 @@ setup_dbus (SensorData *data,
 	return TRUE;
 }
 
+static TabletMode
+calc_tablet_mode (gdouble hinge_angle)
+{
+	/* If hinge axle is vertical */
+	if (hinge_angle < 0)
+		return TABLET_MODE_UNKNOWN;
+
+	return hinge_angle < 190 ? TABLET_MODE_LAPTOP : TABLET_MODE_TABLET;
+}
+
+static void
+hinge_angle_changed_func (SensorDevice *sensor_device,
+			  gpointer      readings_data,
+			  gpointer      user_data)
+{
+	SensorData *data = user_data;
+	HingeAngleReadings *readings = (HingeAngleReadings *) readings_data;
+	TabletMode tablet_mode;
+	PropertiesMask mask = 0;
+
+	g_debug ("Hinge angle sent by driver: %f",
+	         readings->angle);
+
+	if (data->previous_hinge_angle != readings->angle) {
+		gdouble tmp;
+
+		tmp = data->previous_hinge_angle;
+		data->previous_hinge_angle = readings->angle;
+
+		mask |= PROP_HINGE_ANGLE;
+		g_debug ("Emitting hinge angle changed: from %.1f to %.1f",
+			 tmp, data->previous_hinge_angle);
+	}
+
+	//FIXME: Add hysteresis
+	tablet_mode = calc_tablet_mode (readings->angle);
+	if (data->previous_tablet_mode != tablet_mode) {
+		TabletMode tmp;
+
+		tmp = data->previous_tablet_mode;
+		data->previous_tablet_mode = tablet_mode;
+
+		mask |= PROP_TABLET_MODE;
+		g_debug ("Emitting tablet mode changed: from %s to %s",
+			 tablet_mode_to_str (tmp),
+			 tablet_mode_to_str (data->previous_tablet_mode));
+	}
+
+	if (mask) {
+		send_dbus_event (data, mask);
+	}
+}
+
+//FIXME: Use D-Bus GLib API for this
+static gboolean
+lid_is_closed (void)
+{
+	int exit_code;
+
+	exit_code = system ("busctl get-property org.freedesktop.login1 /org/freedesktop/login1 "
+			   "org.freedesktop.login1.Manager LidClosed | grep true");
+
+	return !exit_code;
+}
+
+static void
+calc_accel_hinge_angle(SensorData *data)
+{
+	HingeAngleReadings hinge_angle_readings;
+	double axle_angle;
+	double hinge_angle;
+	AccelReadings r;
+
+	r = data->last_accel_readings[SENSOR_LOCATION_DISPLAY];
+
+	axle_angle = atan2 (sqrt ((double)r.accel_z * r.accel_z + (double)r.accel_x * r.accel_x), r.accel_y) * 180 / M_PI;
+
+	g_debug ("Hinge axle angle: %.1f degrees (x: %d, y: %d, z: %d)", axle_angle, r.accel_x, r.accel_y, r.accel_z);
+
+	/* We cannot calc hinge angle reliable if hinge axle is almost vertical */
+	if ((axle_angle < 10) || (axle_angle > 170)) {
+		g_debug ("Hinge axle is vertical, cannot calc bending angle");
+		return;
+	}
+
+	g_debug ("display angle: %.1f, base angle: %.1f",
+			atan2 (data->last_accel_readings[SENSOR_LOCATION_DISPLAY].accel_z,
+			       data->last_accel_readings[SENSOR_LOCATION_DISPLAY].accel_x) * 180 / M_PI,
+			atan2 (data->last_accel_readings[SENSOR_LOCATION_BASE].accel_z,
+			       data->last_accel_readings[SENSOR_LOCATION_BASE].accel_x) * 180 / M_PI);
+
+	hinge_angle = (atan2 (data->last_accel_readings[SENSOR_LOCATION_DISPLAY].accel_z,
+			      data->last_accel_readings[SENSOR_LOCATION_DISPLAY].accel_x) -
+		       atan2 (data->last_accel_readings[SENSOR_LOCATION_BASE].accel_z,
+			      data->last_accel_readings[SENSOR_LOCATION_BASE].accel_x)) * 180 / M_PI;
+
+	if (hinge_angle < -180)
+		hinge_angle += 360;
+
+	if (hinge_angle > 180)
+		hinge_angle -= 360;
+
+	hinge_angle += 180;
+
+	gboolean lid_closed = lid_is_closed ();
+
+	/*
+	 * Handle the corner case: tablet is closed or bended by 360 deg.
+	 * the calculated hinge angle may be wrapped around 0/360 deg. here,
+	 * check the lid state and normalize
+	 */
+	if (lid_closed)
+		hinge_angle = 0;
+	else if (hinge_angle < 5)
+		hinge_angle = 360;
+
+	//FIXME: Add data validations to filter invalid values caused by vibration
+	g_debug ("Hinge angle is %.1f degrees", hinge_angle);
+
+	hinge_angle_readings.angle = hinge_angle;
+
+	hinge_angle_changed_func (NULL, &hinge_angle_readings, data);
+}
+
 static void
 accel_changed_func (SensorDevice *sensor_device,
 		    gpointer      readings_data,
@@ -742,23 +1043,36 @@ accel_changed_func (SensorDevice *sensor_device,
 	OrientationUp orientation = data->previous_orientation;
 
 	//FIXME handle errors
-	g_debug ("Accel sent by driver (quirk applied): %d, %d, %d (scale: %lf,%lf,%lf)",
+	g_debug ("Accel (%s) sent by driver (quirk applied): %d, %d, %d (scale: %lf,%lf,%lf)",
+		 sensor_device->location == SENSOR_LOCATION_DISPLAY ? "display" : "base",
 		 readings->accel_x, readings->accel_y, readings->accel_z,
 		 readings->scale.x, readings->scale.y, readings->scale.z);
 
-	orientation = orientation_calc (data->previous_orientation,
-					readings->accel_x, readings->accel_y, readings->accel_z,
-					readings->scale);
+	memcpy (&data->last_accel_readings[sensor_device->location],
+	       readings_data, sizeof (AccelReadings));
 
-	if (data->previous_orientation != orientation) {
-		OrientationUp tmp;
+	if (sensor_device->location == SENSOR_LOCATION_DISPLAY) {
+		orientation = orientation_calc (data->previous_orientation,
+				readings->accel_x, readings->accel_y, readings->accel_z,
+				readings->scale);
 
-		tmp = data->previous_orientation;
-		data->previous_orientation = orientation;
-		send_dbus_event (data, PROP_ACCELEROMETER_ORIENTATION);
-		g_debug ("Emitted orientation changed: from %s to %s",
-			 orientation_to_string (tmp),
-			 orientation_to_string (data->previous_orientation));
+		if (data->previous_orientation != orientation) {
+			OrientationUp tmp;
+
+			tmp = data->previous_orientation;
+			data->previous_orientation = orientation;
+			send_dbus_event (data, PROP_ACCELEROMETER_ORIENTATION);
+			g_debug ("Emitted orientation changed: from %s to %s",
+					orientation_to_string (tmp),
+					orientation_to_string (data->previous_orientation));
+		}
+	}
+
+	/* Calculate hinge angle based on accelerometers readings if there is no
+	 * dedicated hinge angle sensor exists */
+	if ((sensor_device->location == SENSOR_LOCATION_BASE) &&
+	    !driver_type_exists (data, DRIVER_TYPE_HINGE_ANGLE)) {
+		calc_accel_hinge_angle (data);
 	}
 }
 
@@ -851,6 +1165,8 @@ driver_type_to_callback_func (DriverType type)
 		return compass_changed_func;
 	case DRIVER_TYPE_PROXIMITY:
 		return proximity_changed_func;
+	case DRIVER_TYPE_HINGE_ANGLE:
+		return hinge_angle_changed_func;
 	default:
 		g_assert_not_reached ();
 	}
@@ -999,6 +1315,7 @@ int main (int argc, char **argv)
 	}
 
 	data->previous_orientation = ORIENTATION_UNDEFINED;
+	data->previous_tablet_mode = TABLET_MODE_UNKNOWN;
 	data->uses_lux = TRUE;
 
 	/* Set up D-Bus */

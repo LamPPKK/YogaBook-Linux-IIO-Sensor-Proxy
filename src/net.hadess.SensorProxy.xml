@@ -100,6 +100,11 @@
     -->
     <property name='ProximityNear' type='b' access='read'/>
 
+    <property name="HasHingeAngle" type="b" access="read"/>
+    <property name="HingeAngle" type="d" access="read"/>
+    <property name="TabletMode" type="s" access="read"/>
+    <method name="ClaimHingeAngle"/>
+    <method name="ReleaseHingeAngle"/>
     <!--
        ClaimAccelerometer:
 

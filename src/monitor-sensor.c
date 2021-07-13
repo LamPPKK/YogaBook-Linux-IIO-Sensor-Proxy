@@ -18,6 +18,7 @@ static gboolean watch_accel = FALSE;
 static gboolean watch_prox = FALSE;
 static gboolean watch_compass = FALSE;
 static gboolean watch_light = FALSE;
+static gboolean watch_hinge_angle = FALSE;
 
 static void
 properties_changed (GDBusProxy *proxy,
@@ -66,6 +67,24 @@ properties_changed (GDBusProxy *proxy,
 			g_print ("+++ Proximity sensor appeared\n");
 		else
 			g_print ("--- Proximity sensor disappeared\n");
+		g_variant_unref (v);
+	}
+	if (g_variant_dict_contains (&dict, "HasHingeAngle")) {
+		v = g_dbus_proxy_get_cached_property (iio_proxy, "HasHingeAngle");
+		if (g_variant_get_boolean (v))
+			g_print ("+++ Hinge angle sensor appeared\n");
+		else
+			g_print ("--- Hinge angle sensor disappeared\n");
+		g_variant_unref (v);
+	}
+	if (g_variant_dict_contains (&dict, "HingeAngle")) {
+		v = g_dbus_proxy_get_cached_property (iio_proxy, "HingeAngle");
+		g_print ("    Hinge angle changed: %.1f\n", g_variant_get_double (v));
+		g_variant_unref (v);
+	}
+	if (g_variant_dict_contains (&dict, "TabletMode")) {
+		v = g_dbus_proxy_get_cached_property (iio_proxy, "TabletMode");
+		g_print ("    Tablet mode changed: %s\n", g_variant_get_string (v, NULL));
 		g_variant_unref (v);
 	}
 	if (g_variant_dict_contains (&dict, "ProximityNear")) {
@@ -135,6 +154,19 @@ print_initial_values (void)
 				 g_variant_get_boolean (v));
 		} else {
 			g_print ("=== No proximity sensor\n");
+		}
+		g_variant_unref (v);
+	}
+
+	if (watch_hinge_angle) {
+		v = g_dbus_proxy_get_cached_property (iio_proxy, "HasHingeAngle");
+		if (g_variant_get_boolean (v)) {
+			g_variant_unref (v);
+			v = g_dbus_proxy_get_cached_property (iio_proxy, "HingeAngle");
+			g_print ("=== Has hinge angle sensor (angle: %.1f)\n",
+				 g_variant_get_double (v));
+		} else {
+			g_print ("=== No hinge angle sensor\n");
 		}
 		g_variant_unref (v);
 	}
@@ -245,6 +277,23 @@ appeared_cb (GDBusConnection *connection,
 		g_clear_pointer (&ret, g_variant_unref);
 	}
 
+	/* Hinge angle sensor */
+	if (watch_hinge_angle) {
+		ret = g_dbus_proxy_call_sync (iio_proxy,
+					      "ClaimHingeAngle",
+					      NULL,
+					      G_DBUS_CALL_FLAGS_NONE,
+					      -1,
+					      NULL, &error);
+		if (!ret) {
+			if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+				g_warning ("Failed to claim hinge angle sensor: %s", error->message);
+			g_main_loop_quit (loop);
+			return;
+		}
+		g_clear_pointer (&ret, g_variant_unref);
+	}
+
 	/* Compass */
 	if (watch_compass) {
 		ret = g_dbus_proxy_call_sync (iio_proxy_compass,
@@ -285,6 +334,7 @@ int main (int argc, char **argv)
 	gboolean opt_watch_prox = FALSE;
 	gboolean opt_watch_compass = FALSE;
 	gboolean opt_watch_light = FALSE;
+	gboolean opt_watch_hinge_angle = FALSE;
 	gboolean opt_all = FALSE;
 	const GOptionEntry options[] = {
 		{ "all", 'a', 0, G_OPTION_ARG_NONE, &opt_all, "Monitor all the sensor changes", NULL },
@@ -292,6 +342,7 @@ int main (int argc, char **argv)
 		{ "proximity", 0, 0, G_OPTION_ARG_NONE, &opt_watch_prox, "Monitor proximity sensor changes", NULL },
 		{ "compass", 0, 0, G_OPTION_ARG_NONE, &opt_watch_compass, "Monitor compass changes", NULL },
 		{ "light", 0, 0, G_OPTION_ARG_NONE, &opt_watch_light, "Monitor light changes changes", NULL },
+		{ "hinge", 0, 0, G_OPTION_ARG_NONE, &opt_watch_hinge_angle, "Monitor hinge angle changes", NULL },
 		{ NULL}
 	};
 	int ret = 0;
@@ -315,9 +366,10 @@ int main (int argc, char **argv)
 	if ((!opt_watch_accel &&
 	     !opt_watch_prox &&
 	     !opt_watch_compass &&
-	     !opt_watch_light) ||
+	     !opt_watch_light &&
+	     !opt_watch_hinge_angle) ||
 	    opt_all) {
-		opt_watch_accel = opt_watch_prox = opt_watch_light = TRUE;
+		opt_watch_accel = opt_watch_prox = opt_watch_light = opt_watch_hinge_angle = TRUE;
 		opt_watch_compass = g_strcmp0 (g_get_user_name (), "geoclue") == 0;
 	}
 
@@ -325,6 +377,7 @@ int main (int argc, char **argv)
 	watch_prox = opt_watch_prox;
 	watch_compass = opt_watch_compass;
 	watch_light = opt_watch_light;
+	watch_hinge_angle = opt_watch_hinge_angle;
 
 	watch_id = g_bus_watch_name (G_BUS_TYPE_SYSTEM,
 				     "net.hadess.SensorProxy",
