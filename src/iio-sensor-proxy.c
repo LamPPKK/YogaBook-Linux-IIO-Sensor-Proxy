@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <linux/uinput.h>
 
 #include <gio/gio.h>
 #include <gudev/gudev.h>
@@ -41,6 +42,7 @@ typedef struct {
 	GDBusNodeInfo *introspection_data;
 	GDBusConnection *connection;
 	guint name_id;
+	int uinput_fd;
 	int ret;
 
 	GPtrArray         *devices[NUM_SENSOR_TYPES]; // SensorDevice
@@ -510,6 +512,88 @@ any_sensors_left (SensorData *data)
 	return FALSE;
 }
 
+static gboolean
+setup_uinput_dev (SensorData *data)
+{
+	struct uinput_setup usetup;
+	int fd;
+	int r;
+
+	fd = open ("/dev/uinput", O_RDWR);
+	if (fd < 0) {
+		g_warning ("Could not open uinput for tablet mode notification: %s",
+			   strerror (errno));
+		return FALSE;
+	}
+
+	r = ioctl(fd, UI_SET_EVBIT, EV_SW);
+	if (r < 0)
+		goto error;
+
+	r = ioctl(fd, UI_SET_SWBIT, SW_TABLET_MODE);
+	if (r < 0)
+		goto error;
+
+
+	memset (&usetup, 0, sizeof(usetup));
+	snprintf(usetup.name, sizeof(usetup.name), "iio-sensor-proxy");
+	usetup.id.bustype = BUS_VIRTUAL;
+	usetup.id.vendor = 0x00;
+	usetup.id.product = 0x00;
+
+	r = ioctl(fd, UI_DEV_SETUP, &usetup);
+	if (r < 0)
+		goto error;
+
+	r = ioctl(fd, UI_DEV_CREATE);
+	if (r < 0)
+		goto error;
+
+	data->uinput_fd = fd;
+
+	return TRUE;
+
+error:
+	g_warning ("Uinput device setup error: %s", strerror(errno));
+	close (fd);
+
+	return FALSE;
+}
+
+static void
+close_uinput_dev (SensorData *data)
+{
+	if (data->uinput_fd == -1)
+		return;
+
+	ioctl(data->uinput_fd, UI_DEV_DESTROY);
+	close (data->uinput_fd);
+
+	data->uinput_fd = -1;
+}
+
+static void
+emit_uinput_event (SensorData *data, int type, int code, int val)
+{
+	struct input_event ev;
+
+	g_debug ("Emitting uinput event: %d %d %d", type, code, val);
+
+	if (data->uinput_fd == -1) {
+		g_warning ("Cannot emit uinput event: device is not initialized");
+		return;
+	}
+
+	ev.type = type;
+	ev.code = code;
+	ev.value = val;
+
+	ev.time.tv_sec = 0;
+	ev.time.tv_usec = 0;
+
+	write (data->uinput_fd, &ev, sizeof(ev));
+}
+
 static void
 virt_hinge_angle_sensor_start (SensorData *data)
 {
@@ -955,6 +1039,10 @@ hinge_angle_changed_func (SensorDevice *sensor_device,
 		g_debug ("Emitting tablet mode changed: from %s to %s",
 			 tablet_mode_to_str (tmp),
 			 tablet_mode_to_str (data->previous_tablet_mode));
+
+		emit_uinput_event (data, EV_SW, SW_TABLET_MODE,
+				tablet_mode == TABLET_MODE_TABLET);
+		emit_uinput_event (data, EV_SYN, SYN_REPORT, 0);
 	}
 
 	if (mask) {
@@ -1185,6 +1273,7 @@ free_sensor_data (SensorData *data)
 		data->name_id = 0;
 	}
 
+	close_uinput_dev (data);
 
 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
 		g_clear_pointer (&data->clients[i], g_hash_table_unref);
@@ -1314,9 +1403,13 @@ int main (int argc, char **argv)
 		data->devices[i] = g_ptr_array_new ();
 	}
 
+	data->uinput_fd = -1;
+
 	data->previous_orientation = ORIENTATION_UNDEFINED;
 	data->previous_tablet_mode = TABLET_MODE_UNKNOWN;
 	data->uses_lux = TRUE;
+
+	setup_uinput_dev (data);
 
 	/* Set up D-Bus */
 	setup_dbus (data, replace);
