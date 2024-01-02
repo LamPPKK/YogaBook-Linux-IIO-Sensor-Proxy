@@ -34,6 +34,10 @@
 
 #define NUM_SENSOR_TYPES DRIVER_TYPE_PROXIMITY + 1
 
+
+#define device_type(dev) (dev->drv->type)
+
+
 typedef struct {
 	GMainLoop *loop;
 	GUdevClient *client;
@@ -43,10 +47,7 @@ typedef struct {
 	int ret;
 
 	PolkitAuthority *auth;
-
-	SensorDriver      *drivers[NUM_SENSOR_TYPES];
-	SensorDevice      *devices[NUM_SENSOR_TYPES];
-	GUdevDevice       *udev_devices[NUM_SENSOR_TYPES];
+	GPtrArray         *devices[NUM_SENSOR_TYPES]; /* SensorDevice */
 	GHashTable        *clients[NUM_SENSOR_TYPES]; /* key = D-Bus name, value = watch ID */
 
 	/* Accelerometer */
@@ -95,20 +96,63 @@ driver_type_to_str (DriverType type)
 	}
 }
 
-#define DRIVER_FOR_TYPE(driver_type) data->drivers[driver_type]
-#define DEVICE_FOR_TYPE(driver_type) data->devices[driver_type]
-#define UDEV_DEVICE_FOR_TYPE(driver_type) data->udev_devices[driver_type]
-
 static void sensor_changes (GUdevClient *client,
 			    gchar       *action,
 			    GUdevDevice *device,
 			    SensorData  *data);
 
+/* Return the default device used for given sensor type */
+static SensorDevice *find_default_device_for_type (SensorData	*data,
+						  DriverType	driver_type)
+{
+	SensorDevice *sensor_device = NULL;
+
+	/* For accelerometers, use the display accelerometer and ignore base accelerometers */
+	if (driver_type == DRIVER_TYPE_ACCEL) {
+		GValue location_prop = G_VALUE_INIT;
+		guint i;
+
+		for (i = 0; i < data->devices[driver_type]->len; i++) {
+			SensorDevice *sd = g_ptr_array_index (data->devices[driver_type], i);
+			AccelLocation location = ACCEL_LOCATION_DISPLAY;
+
+			if (driver_get_property (sd, "location", &location_prop)) {
+				location = g_value_get_enum (&location_prop);
+				g_value_unset (&location_prop);
+			}
+
+			if (location == ACCEL_LOCATION_DISPLAY) {
+				sensor_device = sd;
+				break;
+			}
+		}
+	} else {
+		/* For other sensors, prefer the first one */
+		sensor_device = data->devices[driver_type]->len ? g_ptr_array_index (data->devices[driver_type], 0) : NULL;
+	}
+
+	g_debug ("Default device for %s: %s",
+		 driver_type_to_str (driver_type),
+		 sensor_device ? sensor_device->name : "none");
+
+	return sensor_device;
+}
+
 static gboolean
 driver_type_exists (SensorData *data,
 		    DriverType  driver_type)
 {
-	return (DRIVER_FOR_TYPE(driver_type) != NULL);
+	return find_default_device_for_type (data, driver_type) != NULL;
+}
+
+static gboolean is_default_device (SensorData *data,
+				   SensorDevice *sensor_device)
+{
+	SensorDevice *default_device;
+
+	default_device = find_default_device_for_type (data, device_type (sensor_device));
+
+	return default_device == sensor_device;
 }
 
 static gboolean
@@ -131,24 +175,28 @@ find_sensors (GUdevClient *client,
 
 		for (i = 0; i < G_N_ELEMENTS(drivers); i++) {
 			SensorDriver *driver = (SensorDriver *) drivers[i];
-			if (!driver_type_exists (data, driver->type) &&
-			    driver_discover (driver, dev)) {
+			SensorDevice *sensor_device;
+
+			if (driver_discover (driver, dev)) {
 				g_debug ("Found device %s of type %s at %s",
 					 g_udev_device_get_sysfs_path (dev),
 					 driver_type_to_str (driver->type),
 					 driver->driver_name);
-				UDEV_DEVICE_FOR_TYPE(driver->type) = g_object_ref (dev);
-				DRIVER_FOR_TYPE(driver->type) = (SensorDriver *) driver;
+
+
+				sensor_device = driver_open (driver, dev,
+						driver_type_to_callback_func (driver->type), data);
+				if (!sensor_device) {
+					g_clear_object (&dev);
+					continue;
+				}
+
+				g_ptr_array_add (data->devices[driver->type], sensor_device);
 
 				found = TRUE;
+				break;
 			}
 		}
-
-		if (driver_type_exists (data, DRIVER_TYPE_ACCEL) &&
-		    driver_type_exists (data, DRIVER_TYPE_LIGHT) &&
-		    driver_type_exists (data, DRIVER_TYPE_PROXIMITY) &&
-		    driver_type_exists (data, DRIVER_TYPE_COMPASS))
-			break;
 	}
 
 	g_list_free_full (devices, g_object_unref);
@@ -191,6 +239,10 @@ typedef enum {
 		  PROP_PROXIMITY_NEAR)
 #define PROP_ALL_COMPASS (PROP_HAS_COMPASS | \
 			  PROP_COMPASS_HEADING)
+#define PROP_ALL_HAS (PROP_HAS_ACCELEROMETER | \
+		      PROP_HAS_AMBIENT_LIGHT | \
+		      PROP_HAS_PROXIMITY | \
+		      PROP_HAS_COMPASS)
 
 static PropertiesMask
 mask_for_sensor_type (DriverType sensor_type)
@@ -365,26 +417,23 @@ send_driver_changed_dbus_event (SensorData   *data,
 static gboolean
 any_sensors_left (SensorData *data)
 {
-	guint i;
-	gboolean exists = FALSE;
+	int i;
 
-	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
-		if (driver_type_exists (data, i)) {
-			exists = TRUE;
-			break;
-		}
-	}
+	for (i = 0; i < NUM_SENSOR_TYPES; i++)
+		if (data->devices[i]->len > 0)
+			return TRUE;
 
-	return exists;
+	return FALSE;
 }
 
 static void
-client_release (SensorData            *data,
-		const char            *sender,
-		DriverType             driver_type)
+client_release (SensorData *data,
+		const char *sender,
+		DriverType  driver_type)
 {
 	GHashTable *ht;
 	guint watch_id;
+	SensorDevice *sensor_device;
 
 	ht = data->clients[driver_type];
 
@@ -396,9 +445,8 @@ client_release (SensorData            *data,
 
 	g_hash_table_remove (ht, sender);
 
-	if (driver_type_exists (data, driver_type) &&
-	    g_hash_table_size (ht) == 0) {
-		SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+	sensor_device = find_default_device_for_type (data, driver_type);
+	if (sensor_device && g_hash_table_size (ht) == 0) {
 		driver_set_polling (sensor_device, FALSE);
 	}
 }
@@ -472,9 +520,12 @@ handle_generic_method_call (SensorData            *data,
 {
 	GHashTable *ht;
 	guint watch_id;
+	SensorDevice *sensor_device;
 
 	g_debug ("Handling driver refcounting method '%s' for %s device",
 		 method_name, driver_type_to_str (driver_type));
+
+	sensor_device = find_default_device_for_type (data, driver_type);
 
 	ht = data->clients[driver_type];
 
@@ -487,9 +538,7 @@ handle_generic_method_call (SensorData            *data,
 		}
 
 		/* No other clients for this sensor? Start it */
-		if (driver_type_exists (data, driver_type) &&
-		    g_hash_table_size (ht) == 0) {
-			SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver_type);
+		if (sensor_device && (g_hash_table_size (ht) == 0)) {
 			driver_set_polling (sensor_device, TRUE);
 		}
 
@@ -630,7 +679,7 @@ handle_compass_get_property (GDBusConnection *connection,
 	g_assert (data->connection);
 
 	if (g_strcmp0 (property_name, "HasCompass") == 0)
-		return g_variant_new_boolean (data->drivers[DRIVER_TYPE_COMPASS] != NULL);
+		return g_variant_new_boolean (driver_type_exists (data, DRIVER_TYPE_COMPASS));
 	if (g_strcmp0 (property_name, "CompassHeading") == 0)
 		return g_variant_new_double (data->previous_heading);
 
@@ -696,26 +745,8 @@ name_acquired_handler (GDBusConnection *connection,
 			  G_CALLBACK (sensor_changes), data);
 
 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
-		SensorDevice *sensor_device;
-
 		data->clients[i] = create_clients_hash_table ();
-
-		if (!driver_type_exists (data, i))
-			continue;
-
-		sensor_device = driver_open (DRIVER_FOR_TYPE(i), UDEV_DEVICE_FOR_TYPE(i),
-					     driver_type_to_callback_func (data->drivers[i]->type), data);
-		if (!sensor_device) {
-			DRIVER_FOR_TYPE(i) = NULL;
-			g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
-			continue;
-		}
-
-		DEVICE_FOR_TYPE(i) = sensor_device;
 	}
-
-	if (!any_sensors_left (data))
-		goto bail;
 
 	send_dbus_event (data, PROP_ALL);
 	send_dbus_event (data, PROP_ALL_COMPASS);
@@ -771,6 +802,12 @@ accel_changed_func (SensorDevice *sensor_device,
 		 readings->accel_x, readings->accel_y, readings->accel_z,
 		 readings->scale.x, readings->scale.y, readings->scale.z);
 
+	if (!is_default_device (data, sensor_device)) {
+		g_debug ("Skip parsing the readings: %s is not a default device",
+			 sensor_device->name);
+		return;
+	}
+
 	orientation = orientation_calc (data->previous_orientation,
 					readings->accel_x, readings->accel_y, readings->accel_z,
 					readings->scale);
@@ -799,6 +836,12 @@ light_changed_func (SensorDevice *sensor_device,
 	g_debug ("Light level sent by driver (quirk applied): %lf (unit: %s)",
 		 readings->level, data->uses_lux ? "lux" : "vendor");
 
+	if (!is_default_device (data, sensor_device)) {
+		g_debug ("Skip parsing the readings: %s is not a default device",
+			 sensor_device->name);
+		return;
+	}
+
 	if (data->previous_level != readings->level ||
 	    data->uses_lux != readings->uses_lux) {
 		gdouble tmp;
@@ -826,6 +869,12 @@ compass_changed_func (SensorDevice *sensor_device,
 	g_debug ("Heading sent by driver (quirk applied): %lf degrees",
 	         readings->heading);
 
+	if (!is_default_device (data, sensor_device)) {
+		g_debug ("Skip parsing the readings: %s is not a default device",
+			 sensor_device->name);
+		return;
+	}
+
 	if (data->previous_heading != readings->heading) {
 		gdouble tmp;
 
@@ -850,6 +899,12 @@ proximity_changed_func (SensorDevice *sensor_device,
 	//FIXME handle errors
 	g_debug ("Proximity sent by driver: %d",
 	         readings->is_near);
+
+	if (!is_default_device (data, sensor_device)) {
+		g_debug ("Skip parsing the readings: %s is not a default device",
+			 sensor_device->name);
+		return;
+	}
 
 	near = readings->is_near > 0;
 	if (data->previous_prox_near != near) {
@@ -884,7 +939,7 @@ driver_type_to_callback_func (DriverType type)
 static void
 free_sensor_data (SensorData *data)
 {
-	guint i;
+	guint i, j;
 
 	if (data == NULL)
 		return;
@@ -894,11 +949,16 @@ free_sensor_data (SensorData *data)
 		data->name_id = 0;
 	}
 
+
 	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
-		if (driver_type_exists (data, i))
-			driver_close (DEVICE_FOR_TYPE(i));
-		g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
 		g_clear_pointer (&data->clients[i], g_hash_table_unref);
+
+		for (j = 0; j < data->devices[i]->len; j++) {
+			SensorDevice *dev = g_ptr_array_index (data->devices[i], j);
+			driver_close (dev);
+		}
+
+		g_ptr_array_free (data->devices[i], TRUE);
 	}
 
 	g_clear_object (&data->auth);
@@ -915,33 +975,41 @@ sensor_changes (GUdevClient *client,
 		GUdevDevice *device,
 		SensorData  *data)
 {
-	guint i;
+	guint i, j;
 
 	g_debug ("Sensor changes: action = %s, device = %s",
 		 action, g_udev_device_get_sysfs_path (device));
 
 	if (g_strcmp0 (action, "remove") == 0) {
+		gboolean found = FALSE;
 		for (i = 0; i < NUM_SENSOR_TYPES; i++) {
-			GUdevDevice *dev = UDEV_DEVICE_FOR_TYPE(i);
+			for (j = 0; j < data->devices[i]->len; j++) {
+				SensorDevice *sensor_device = g_ptr_array_index (data->devices[i], j);
+				GUdevDevice *dev = sensor_device->udev_device;
 
-			if (!dev)
-				continue;
+				if (g_strcmp0 (g_udev_device_get_sysfs_path (device), g_udev_device_get_sysfs_path (dev)) == 0) {
+					g_debug ("Sensor type %s (%p) got removed (%s)",
+							driver_type_to_str (i),
+							sensor_device,
+							g_udev_device_get_sysfs_path (dev));
 
-			if (g_strcmp0 (g_udev_device_get_sysfs_path (device), g_udev_device_get_sysfs_path (dev)) == 0) {
-				g_debug ("Sensor type %s got removed (%s)",
-					 driver_type_to_str (i),
-					 g_udev_device_get_sysfs_path (dev));
+					driver_close (sensor_device);
 
-				g_clear_object (&UDEV_DEVICE_FOR_TYPE(i));
-				driver_close (DEVICE_FOR_TYPE(i));
-				DEVICE_FOR_TYPE(i) = NULL;
-				DRIVER_FOR_TYPE(i) = NULL;
+					g_ptr_array_remove_index (data->devices[i], j);
 
-				g_clear_pointer (&data->clients[i], g_hash_table_unref);
-				data->clients[i] = create_clients_hash_table ();
+					if (!find_default_device_for_type (data, i)) {
+						g_clear_pointer (&data->clients[i], g_hash_table_unref);
+						data->clients[i] = create_clients_hash_table ();
+					}
 
-				send_driver_changed_dbus_event (data, i);
+					send_driver_changed_dbus_event (data, i);
+					found = TRUE;
+					break;
+				}
 			}
+
+			if (found)
+				break;
 		}
 
 		if (!any_sensors_left (data))
@@ -949,10 +1017,9 @@ sensor_changes (GUdevClient *client,
 	} else if (g_strcmp0 (action, "add") == 0) {
 		for (i = 0; i < G_N_ELEMENTS(drivers); i++) {
 			SensorDriver *driver = (SensorDriver *) drivers[i];
-			if (!driver_type_exists (data, driver->type) &&
-			    driver_discover (driver, device)) {
-				SensorDevice *sensor_device = NULL;
 
+			if (driver_discover (driver, device)) {
+				SensorDevice *sensor_device = NULL;
 				g_debug ("Found hotplugged device %s of type %s at %s",
 					 g_udev_device_get_sysfs_path (device),
 					 driver_type_to_str (driver->type),
@@ -964,15 +1031,12 @@ sensor_changes (GUdevClient *client,
 				if (sensor_device) {
 					GHashTable *ht;
 
-					UDEV_DEVICE_FOR_TYPE(driver->type) = g_object_ref (device);
-					DEVICE_FOR_TYPE(driver->type) = sensor_device;
-					DRIVER_FOR_TYPE(driver->type) = (SensorDriver *) driver;
+					g_ptr_array_add (data->devices[driver->type], sensor_device);
 					send_driver_changed_dbus_event (data, driver->type);
 
 					ht = data->clients[driver->type];
 
 					if (g_hash_table_size (ht) > 0) {
-						SensorDevice *sensor_device = DEVICE_FOR_TYPE(driver->type);
 						driver_set_polling (sensor_device, TRUE);
 					}
 				}
@@ -1005,6 +1069,7 @@ int main (int argc, char **argv)
 		{ "replace", 'r', 0, G_OPTION_ARG_NONE, &replace, "Replace the running instance of iio-sensor-proxy", NULL },
 		{ NULL}
 	};
+	int i;
 	int ret = 0;
 
 	setlocale (LC_ALL, "");
@@ -1026,6 +1091,11 @@ int main (int argc, char **argv)
 	}
 
 	data = g_new0 (SensorData, 1);
+
+	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+		data->devices[i] = g_ptr_array_new ();
+	}
+
 	data->previous_orientation = ORIENTATION_UNDEFINED;
 	data->uses_lux = TRUE;
 

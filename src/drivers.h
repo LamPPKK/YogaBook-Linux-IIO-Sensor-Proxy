@@ -6,6 +6,8 @@
  * the Free Software Foundation.
  */
 
+#pragma once
+
 #include <glib.h>
 #include <gudev/gudev.h>
 
@@ -68,6 +70,7 @@ typedef struct {
 
 struct SensorDevice {
 	SensorDriver        *drv;
+	GUdevDevice         *udev_device;
 	gpointer             priv;
 	char                *name;
 
@@ -80,25 +83,11 @@ static inline gboolean
 driver_discover (SensorDriver *driver,
 		 GUdevDevice  *device)
 {
-	AccelLocation location;
-
 	g_return_val_if_fail (driver, FALSE);
 	g_return_val_if_fail (driver->discover, FALSE);
 	g_return_val_if_fail (device, FALSE);
 
-	if (!driver->discover (device))
-		return FALSE;
-
-	if (driver->type != DRIVER_TYPE_ACCEL)
-		return TRUE;
-
-	location = setup_accel_location (device);
-	if (location == ACCEL_LOCATION_DISPLAY)
-		return TRUE;
-
-	g_debug ("Ignoring accelerometer in location '%s'",
-		 accel_location_to_string (location));
-	return FALSE;
+	return driver->discover (device);
 }
 
 static inline SensorDevice *
@@ -118,6 +107,7 @@ driver_open (SensorDriver       *driver,
 	if (!sensor_device)
 		return NULL;
 	sensor_device->drv = driver;
+	sensor_device->udev_device = g_object_ref (device);
 	sensor_device->callback_func = callback_func;
 	sensor_device->user_data = user_data;
 	return sensor_device;
@@ -147,6 +137,7 @@ driver_close (SensorDevice *sensor_device)
 	g_return_if_fail (sensor_device);
 	driver_set_polling (sensor_device, FALSE);
 	g_clear_pointer (&sensor_device->name, g_free);
+	g_clear_object (&sensor_device->udev_device);
 	driver = sensor_device->drv;
 	g_return_if_fail (driver->close);
 	driver->close (sensor_device);
