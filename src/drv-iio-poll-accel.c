@@ -94,6 +94,22 @@ iio_poll_accel_set_polling (SensorDevice *sensor_device,
 	}
 }
 
+static gboolean
+iio_poll_accel_get_property (SensorDevice *sensor_device,
+			     const char   *property,
+			     GValue       *value)
+{
+	DrvData *drv_data = (DrvData *) sensor_device->priv;
+
+	if (g_strcmp0 (property, "location") == 0) {
+		g_value_init (value, G_TYPE_ENUM);
+		g_value_set_enum (value, drv_data->location);
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
 static SensorDevice *
 iio_poll_accel_open (GUdevDevice *device)
 {
@@ -133,6 +149,7 @@ SensorDriver iio_poll_accel = {
 	.driver_name = "IIO Poll accelerometer",
 	.type = DRIVER_TYPE_ACCEL,
 
+	.get_property = iio_poll_accel_get_property,
 	.discover = iio_poll_accel_discover,
 	.open = iio_poll_accel_open,
 	.set_polling = iio_poll_accel_set_polling,

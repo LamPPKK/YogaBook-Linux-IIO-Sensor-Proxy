@@ -190,6 +190,23 @@ first_values (gpointer user_data)
 	return G_SOURCE_REMOVE;
 }
 
+static gboolean
+input_accel_get_property (SensorDevice *sensor_device,
+			       const char   *property,
+			       GValue       *value)
+{
+	DrvData *drv_data = (DrvData *) sensor_device->priv;
+
+	if (g_strcmp0 (property, "location") == 0) {
+		g_value_init (value, G_TYPE_ENUM);
+		g_value_set_enum (value, drv_data->location);
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+
 static SensorDevice *
 input_accel_open (GUdevDevice *device)
 {
@@ -273,6 +290,7 @@ SensorDriver input_accel = {
 	.driver_name = "Input accelerometer",
 	.type = DRIVER_TYPE_ACCEL,
 
+	.get_property = input_accel_get_property,
 	.discover = input_accel_discover,
 	.open = input_accel_open,
 	.set_polling = input_accel_set_polling,

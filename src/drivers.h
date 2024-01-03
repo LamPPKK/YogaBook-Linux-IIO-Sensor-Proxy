@@ -56,6 +56,9 @@ typedef struct {
 	const char             *driver_name;
 	DriverType              type;
 
+	gboolean       (*get_property) (SensorDevice       *device,
+					const char         *property,
+					GValue             *value);
 	gboolean       (*discover)    (GUdevDevice        *device);
 	SensorDevice * (*open)        (GUdevDevice        *device);
 	void           (*set_polling) (SensorDevice       *device,
@@ -147,6 +150,21 @@ driver_close (SensorDevice *sensor_device)
 	driver = sensor_device->drv;
 	g_return_if_fail (driver->close);
 	driver->close (sensor_device);
+}
+
+static inline gboolean
+driver_get_property (SensorDevice *sensor_device,
+		     const char *property,
+		     GValue *value)
+{
+	SensorDriver *driver;
+
+	g_return_val_if_fail (sensor_device, FALSE);
+	driver = sensor_device->drv;
+	g_return_val_if_fail (driver, FALSE);
+	g_return_val_if_fail (driver->get_property, FALSE);
+
+	return driver->get_property (sensor_device, property, value);
 }
 
 extern SensorDriver iio_buffer_accel;
