@@ -936,6 +936,27 @@ driver_type_to_callback_func (DriverType type)
 	}
 }
 
+static SensorData *
+allocate_sensor_data (void)
+{
+	SensorData *data;
+	guint i;
+
+	data = g_new0 (SensorData, 1);
+
+	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
+		data->devices[i] = g_ptr_array_new ();
+	}
+
+	data->previous_orientation = ORIENTATION_UNDEFINED;
+	data->uses_lux = TRUE;
+	data->previous_level = 0.0;
+	data->previous_heading = 0.0;
+	data->previous_prox_near = FALSE;
+
+	return data;
+}
+
 static void
 free_sensor_data (SensorData *data)
 {
@@ -1069,7 +1090,6 @@ int main (int argc, char **argv)
 		{ "replace", 'r', 0, G_OPTION_ARG_NONE, &replace, "Replace the running instance of iio-sensor-proxy", NULL },
 		{ NULL}
 	};
-	int i;
 	int ret = 0;
 
 	setlocale (LC_ALL, "");
@@ -1090,20 +1110,13 @@ int main (int argc, char **argv)
 		g_debug ("Starting iio-sensor-proxy version "VERSION);
 	}
 
-	data = g_new0 (SensorData, 1);
-
-	for (i = 0; i < NUM_SENSOR_TYPES; i++) {
-		data->devices[i] = g_ptr_array_new ();
-	}
-
-	data->previous_orientation = ORIENTATION_UNDEFINED;
-	data->uses_lux = TRUE;
+	data = allocate_sensor_data ();
 
 	/* Set up D-Bus */
 	setup_dbus (data, replace);
 
 	data->auth = polkit_authority_get_sync (NULL, NULL);
-	data->loop = g_main_loop_new (NULL, TRUE);
+	data->loop = g_main_loop_new (NULL, FALSE);
 
 	g_unix_signal_add (SIGINT, (GSourceFunc) termination_signal_handler, data);
 	g_unix_signal_add (SIGTERM, (GSourceFunc) termination_signal_handler, data);
